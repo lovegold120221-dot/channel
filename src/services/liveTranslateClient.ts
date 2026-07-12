@@ -171,8 +171,8 @@ export class LiveTranslateClient {
   private turnIntervalId: any = null;
   private silenceTimeoutId: any = null;
   private targetLanguage: string = "English";
+  private genre: string = "";
 
-  private ws: WebSocket | null = null;
   private currentTurnOriginal: string = "";
   private currentTurnTranslated: string = "";
   private isNewTurn: boolean = true;
@@ -194,7 +194,6 @@ export class LiveTranslateClient {
   }
 
   public async connect(targetLanguage: string, onStateChange: (state: LiveTranslateState) => void, sourceLanguage?: string, genre?: string) {
-    // Proactively initialize and resume globalPlaybackContext during the user's click gesture synchronous flow
     try {
       if (!this.playbackContext) {
         this.playbackContext = new (window.AudioContext || (window as any).webkitAudioContext)({
@@ -205,25 +204,23 @@ export class LiveTranslateClient {
         await this.playbackContext.resume();
       }
       this.nextStartTime = this.playbackContext.currentTime;
-      console.log(`[Live Translate Client] Pre-initialized and resumed playbackContext! State is "${this.playbackContext.state}"`);
     } catch (playbackErr) {
-      console.warn("[Live Translate Client] Failed to warm up playbackContext under gesture handler:", playbackErr);
+      console.warn("[Live Translate Client] Failed to warm up playbackContext:", playbackErr);
     }
 
     if (this.state.status === "connected" || this.state.status === "connecting") {
       if (this.targetLanguage === targetLanguage) {
         return;
       }
-      console.log(`[Live Translate Client] Re-establishing connection due to changed parameters (language)...`);
       this.disconnect();
     }
 
-    // Unconditionally clear and reset the recording buffer and turn state at the start of every translation cycle
     this.accumulatedSamples = [];
     this.totalSampleCount = 0;
     this.currentTurnOriginal = "";
     this.currentTurnTranslated = "";
     this.isNewTurn = true;
+    this.genre = genre || "";
 
     this.onStateChange = onStateChange;
     this.targetLanguage = targetLanguage;
@@ -235,152 +232,20 @@ export class LiveTranslateClient {
     });
 
     try {
-      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      let wsUrl = `${protocol}//${window.location.host}/api/live-stream?targetLanguage=${encodeURIComponent(targetLanguage)}`;
-      if (sourceLanguage) {
-        wsUrl += `&sourceLanguage=${encodeURIComponent(sourceLanguage)}`;
-      }
-      if (genre) {
-        wsUrl += `&genre=${encodeURIComponent(genre)}`;
-      }
-      this.ws = new WebSocket(wsUrl);
+      await this.startDOMAudioCapture();
+      this.updateState({ status: "connected" });
 
-      this.currentTurnOriginal = "";
-      this.currentTurnTranslated = "";
-      this.isNewTurn = true;
+      this.accumulatedSamples = [];
+      this.totalSampleCount = 0;
 
-      this.ws.onopen = async () => {
-        try {
-          // Clear any potentially queued samples during the WS handshaking phase
-          this.accumulatedSamples = [];
-          this.totalSampleCount = 0;
-
-          // Initialize DOM audio capturing while in "connecting" state to prevent race conditions
-          await this.startDOMAudioCapture();
-
-          // Transition to "connected" state only after capture initialization completes
-          this.updateState({ status: "connected" });
-
-          // Reset the recording buffers completely for a clean slate
-          this.accumulatedSamples = [];
-          this.totalSampleCount = 0;
-
-          // Send audio chunks continuously every 1000ms for smooth, real-time continuous flow
-          this.intervalId = setInterval(() => {
-            this.sendAccumulatedAudioStream();
-          }, 1000);
-        } catch (captureErr: any) {
-          console.error("[Live Translate Client] Failed to start audio capture in onopen handler:", captureErr);
-          this.updateState({
-            status: "error",
-            error: captureErr.message || String(captureErr)
-          });
-          this.disconnect(true);
-        }
-      };
-
-      this.ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          
-          const errorMessage = data.error || (data.type === "error" ? data.text : null);
-          if (errorMessage) {
-            this.updateState({
-              status: "error",
-              error: errorMessage
-            });
-            this.disconnect(true);
-            return;
-          }
-          
-          let updatedOriginal = this.currentTurnOriginal;
-          let updatedTranslated = this.currentTurnTranslated;
-          let hasTextUpdate = false;
-
-          if (data.originalText) {
-            updatedOriginal += (updatedOriginal ? " " : "") + data.originalText;
-            this.currentTurnOriginal = updatedOriginal;
-            hasTextUpdate = true;
-          }
-          if (data.translatedText) {
-            updatedTranslated += (updatedTranslated ? " " : "") + data.translatedText;
-            this.currentTurnTranslated = updatedTranslated;
-            hasTextUpdate = true;
-          }
-
-          const commitCurrentTurn = () => {
-            const orig = this.currentTurnOriginal.trim();
-            const trans = this.currentTurnTranslated.trim();
-            if (orig || trans) {
-              const turns = [...this.state.turns];
-              turns.push({
-                originalText: orig || "(Listening...)",
-                translatedText: trans || `(Translated to ${this.targetLanguage})`,
-                timestamp: new Date()
-              });
-              this.updateState({
-                turns: turns.slice(-20),
-                userTranscript: "",
-                modelTranscript: ""
-              });
-            } else {
-              this.updateState({
-                userTranscript: "",
-                modelTranscript: ""
-              });
-            }
-            this.currentTurnOriginal = "";
-            this.currentTurnTranslated = "";
-          };
-
-          if (hasTextUpdate) {
-            this.updateState({
-              userTranscript: updatedOriginal,
-              modelTranscript: updatedTranslated
-            });
-
-            // Reset dynamic silence timeout (wrap and commit turn after 8 seconds of silence)
-            if (this.silenceTimeoutId) {
-              clearTimeout(this.silenceTimeoutId);
-            }
-            this.silenceTimeoutId = setTimeout(() => {
-              commitCurrentTurn();
-            }, 8000);
-          }
-
-          if (data.turnComplete) {
-            if (this.silenceTimeoutId) {
-              clearTimeout(this.silenceTimeoutId);
-              this.silenceTimeoutId = null;
-            }
-            commitCurrentTurn();
-          }
-
-          if (data.audio) {
-            this.playAudioChunk(data.audio);
-          }
-        } catch (e) {}
-      };
-
-      this.ws.onerror = (err) => {
-        console.error("[Live Translate Client] WebSocket error:", err);
-        this.updateState({
-          status: "error",
-          error: "WebSocket streaming error. Please check server connection."
-        });
-        this.disconnect(true);
-      };
-
-      this.ws.onclose = () => {
-        console.log("[Live Translate Client] WebSocket closed.");
-        this.disconnect(true);
-      };
-
-    } catch (err: any) {
-      console.error("Failed to connect WebSocket stream:", err);
+      this.intervalId = setInterval(() => {
+        this.sendAccumulatedAudioStream();
+      }, 1000);
+    } catch (captureErr: any) {
+      console.error("[Live Translate Client] Failed to start audio capture:", captureErr);
       this.updateState({
         status: "error",
-        error: "Failed to establish live streaming session: " + (err.message || String(err)),
+        error: captureErr.message || String(captureErr)
       });
       this.disconnect(true);
     }
@@ -471,12 +336,11 @@ export class LiveTranslateClient {
     }
   }
 
-  private sendAccumulatedAudioStream() {
-    if (this.state.status !== "connected" || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+  private async sendAccumulatedAudioStream() {
+    if (this.state.status !== "connected") return;
     if (this.accumulatedSamples.length === 0 || this.totalSampleCount === 0) return;
 
     if (this.totalSampleCount < 4000) {
-      // Keep accumulating if we have less than 250ms of audio, don't discard!
       return;
     }
 
@@ -493,7 +357,102 @@ export class LiveTranslateClient {
     const wavBuffer = encodeWAV(resampled, 16000);
     const base64Wav = arrayBufferToBase64(wavBuffer);
 
-    this.ws.send(JSON.stringify({ audio: base64Wav }));
+    try {
+      const response = await fetch("/api/translate-audio", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          audio: base64Wav,
+          targetLanguage: this.targetLanguage,
+          genre: this.genre
+        })
+      });
+
+      if (!response.ok) {
+        console.warn("[Live Translate Client] HTTP error:", response.status);
+        return;
+      }
+
+      const data = await response.json();
+
+      if (data.error) {
+        this.updateState({ status: "error", error: data.error });
+        this.disconnect(true);
+        return;
+      }
+
+      if (!data.originalText && !data.translatedText && !data.audio) {
+        return;
+      }
+
+      let updatedOriginal = this.currentTurnOriginal;
+      let updatedTranslated = this.currentTurnTranslated;
+      let hasTextUpdate = false;
+
+      if (data.originalText) {
+        updatedOriginal += (updatedOriginal ? " " : "") + data.originalText;
+        this.currentTurnOriginal = updatedOriginal;
+        hasTextUpdate = true;
+      }
+      if (data.translatedText) {
+        updatedTranslated += (updatedTranslated ? " " : "") + data.translatedText;
+        this.currentTurnTranslated = updatedTranslated;
+        hasTextUpdate = true;
+      }
+
+      const commitCurrentTurn = () => {
+        const orig = this.currentTurnOriginal.trim();
+        const trans = this.currentTurnTranslated.trim();
+        if (orig || trans) {
+          const turns = [...this.state.turns];
+          turns.push({
+            originalText: orig || "(Listening...)",
+            translatedText: trans || `(Translated to ${this.targetLanguage})`,
+            timestamp: new Date()
+          });
+          this.updateState({
+            turns: turns.slice(-20),
+            userTranscript: "",
+            modelTranscript: ""
+          });
+        } else {
+          this.updateState({
+            userTranscript: "",
+            modelTranscript: ""
+          });
+        }
+        this.currentTurnOriginal = "";
+        this.currentTurnTranslated = "";
+      };
+
+      if (hasTextUpdate) {
+        this.updateState({
+          userTranscript: updatedOriginal,
+          modelTranscript: updatedTranslated
+        });
+
+        if (this.silenceTimeoutId) {
+          clearTimeout(this.silenceTimeoutId);
+        }
+        this.silenceTimeoutId = setTimeout(() => {
+          commitCurrentTurn();
+        }, 8000);
+      }
+
+      if (data.audio) {
+        this.playAudioChunk(data.audio);
+      }
+
+      if (data.turnComplete) {
+        if (this.silenceTimeoutId) {
+          clearTimeout(this.silenceTimeoutId);
+          this.silenceTimeoutId = null;
+        }
+        commitCurrentTurn();
+      }
+    } catch (err) {
+      console.error("[Live Translate Client] HTTP request failed:", err);
+    }
   }
 
   private playAudioChunk(base64Pcm: string) {
@@ -569,18 +528,6 @@ export class LiveTranslateClient {
     if (this.silenceTimeoutId) {
       clearTimeout(this.silenceTimeoutId);
       this.silenceTimeoutId = null;
-    }
-
-    if (this.ws) {
-      try {
-        // Clear listeners to prevent background close/error events of the closed socket from destroying the new session
-        this.ws.onclose = null;
-        this.ws.onerror = null;
-        this.ws.onmessage = null;
-        this.ws.send(JSON.stringify({ stop: true }));
-        this.ws.close();
-      } catch (e) {}
-      this.ws = null;
     }
 
     if (this.micProcessor) {

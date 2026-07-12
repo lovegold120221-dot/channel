@@ -1076,6 +1076,137 @@ app.post("/api/live-transcribe", async (req, res) => {
   }
 });
 
+// 2c. Translate audio chunk (serverless-friendly — no WebSocket needed)
+app.post("/api/translate-audio", async (req, res) => {
+  const { audio, targetLanguage, voiceName = "Echo", genre = "" } = req.body;
+
+  if (!audio || !targetLanguage) {
+    return res.status(400).json({ error: "Missing audio or targetLanguage" });
+  }
+
+  try {
+    // Step 1: Transcribe the audio using Gemini (supports audio inline data)
+    console.log(`[Translate Audio] Transcribing audio chunk...`);
+
+    const transcriptionResponse = await safeGenerateContent({
+      preferredModel: "gemini-3.1-flash-lite",
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { text: "Transcribe all speech in this audio accurately word for word. If there is no clear speech, return empty string. Never invent or guess." },
+            { inlineData: { mimeType: "audio/wav", data: audio } }
+          ]
+        }
+      ],
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: { transcription: { type: Type.STRING } },
+          required: ["transcription"]
+        }
+      }
+    });
+
+    let transcribedText = "";
+    try {
+      const parsed = JSON.parse(transcriptionResponse.text || "{}");
+      transcribedText = (parsed.transcription || "").trim();
+    } catch {
+      transcribedText = (transcriptionResponse.text || "").trim();
+    }
+
+    if (!transcribedText) {
+      console.log(`[Translate Audio] No speech detected in audio chunk.`);
+      return res.json({ originalText: "", translatedText: "", audio: "" });
+    }
+
+    console.log(`[Translate Audio] Transcribed: "${transcribedText.slice(0, 100)}..."`);
+
+    // Step 2: Translate using Gemini Live API (stateless per request)
+    let translatedText = transcribedText;
+    let accumulatedAudioBuffers: Buffer[] = [];
+    let translatedAccumulated = "";
+
+    try {
+      const session = await connectToLiveResilient({
+        model: "gemini-3.5-live-translate-preview",
+        config: {
+          responseModalities: [Modality.AUDIO, Modality.TEXT],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName } }
+          },
+          translationConfig: {
+            targetLanguageCode: getLanguageCode(targetLanguage),
+            echoTargetLanguage: true
+          },
+          systemInstruction: {
+            parts: [{ text: `Translate the following text into standard ${targetLanguage}.${genre ? ` The current radio program genre is ${genre}. Adjust your vocabulary, tone, and pacing to match this genre.` : ''} Speak the translated text naturally.` }]
+          }
+        },
+        callbacks: {
+          onmessage: (msg) => {
+            if (msg.setupComplete) {
+              session.sendRealtimeInput({ text: transcribedText });
+              setTimeout(() => session.sendRealtimeInput({ activityEnd: {} }), 500);
+            }
+            if (msg.serverContent?.outputTranscription?.text) {
+              translatedAccumulated += msg.serverContent.outputTranscription.text + " ";
+            }
+            if (msg.serverContent?.modelTurn) {
+              msg.serverContent.modelTurn.parts.forEach((p: any) => {
+                if (p.text) translatedAccumulated += p.text + " ";
+                if (p.inlineData?.data) {
+                  accumulatedAudioBuffers.push(Buffer.from(p.inlineData.data, "base64"));
+                }
+              });
+            }
+            if (msg.serverContent?.turnComplete) {
+              session.close();
+            }
+          },
+          onerror: (err) => {
+            console.error("[Translate Audio] Live error:", err);
+            session.close();
+          }
+        }
+      });
+
+      // Wait for translation to complete
+      await new Promise<void>((resolve) => {
+        const checkDone = setInterval(() => {
+          if (accumulatedAudioBuffers.length > 0 || translatedAccumulated.length > 0) {
+            clearInterval(checkDone);
+            resolve();
+          }
+        }, 200);
+        setTimeout(() => { clearInterval(checkDone); resolve(); }, 8000);
+      });
+
+      translatedText = translatedAccumulated.trim() || transcribedText;
+    } catch (err: any) {
+      console.warn("[Translate Audio] Translation step failed, returning transcription only:", err?.message || err);
+    }
+
+    const combinedAudio = accumulatedAudioBuffers.length > 0
+      ? Buffer.concat(accumulatedAudioBuffers).toString("base64")
+      : "";
+
+    return res.json({
+      originalText: transcribedText,
+      translatedText,
+      audio: combinedAudio
+    });
+
+  } catch (err: any) {
+    console.error("[Translate Audio] Error:", err?.message || err);
+    if (!res.headersSent) {
+      return res.status(500).json({ error: err?.message || String(err) });
+    }
+  }
+});
+
 // 3. Factual Program Insights & Music Curation Generator (100% real educational facts)
 app.post("/api/generate-feed", async (req, res) => {
   const { stationName, country, genre, language } = req.body;
