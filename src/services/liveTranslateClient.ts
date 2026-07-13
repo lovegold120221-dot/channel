@@ -340,7 +340,7 @@ export class LiveTranslateClient {
     if (this.state.status !== "connected") return;
     if (this.accumulatedSamples.length === 0 || this.totalSampleCount === 0) return;
 
-    if (this.totalSampleCount < 4000) {
+    if (this.totalSampleCount < 16000) {
       return;
     }
 
@@ -369,14 +369,23 @@ export class LiveTranslateClient {
       });
 
       if (!response.ok) {
-        console.warn("[Live Translate Client] HTTP error:", response.status);
+        const errBody = await response.text().catch(() => "");
+        console.error("[Live Translate Client] HTTP error:", response.status, errBody);
+        this.updateState({
+          status: "error",
+          error: `Translation server error (${response.status}). Check Vercel function logs.`
+        });
         return;
       }
 
       const data = await response.json();
 
       if (data.error) {
-        this.updateState({ status: "error", error: data.error });
+        console.error("[Live Translate Client] Server error:", data.error);
+        this.updateState({
+          status: "error",
+          error: data.error
+        });
         this.disconnect(true);
         return;
       }
@@ -535,13 +544,20 @@ export class LiveTranslateClient {
       try {
         this.micProcessor.disconnect();
       } catch (e) {}
+      globalMicProcessor = null;
     }
 
-    if (this.sourceNode && this.micProcessor) {
+    if (this.sourceNode) {
       try {
-        this.sourceNode.disconnect(this.micProcessor);
+        this.sourceNode.disconnect(this.micProcessor || undefined);
+      } catch (e) {}
+      try {
+        this.sourceNode.disconnect(this.radioGainNode || undefined);
       } catch (e) {}
     }
+    globalSourceNode = null;
+    this.sourceNode = null;
+    this.radioGainNode = null;
 
     const audioElement = document.querySelector("video, audio") as HTMLMediaElement | null;
     const isRadioPlaying = !!(audioElement && !audioElement.paused && !audioElement.ended);

@@ -1085,44 +1085,53 @@ app.post("/api/translate-audio", async (req, res) => {
   }
 
   try {
-    // Step 1: Transcribe the audio using Gemini (supports audio inline data)
-    console.log(`[Translate Audio] Transcribing audio chunk...`);
+    // Step 1: Transcribe the audio using Gemini
+    console.log(`[Translate Audio] Transcribing audio chunk (${Math.round(audio.length / 1.37)} bytes raw)...`);
 
-    const transcriptionResponse = await safeGenerateContent({
-      preferredModel: "gemini-3.1-flash-lite",
-      contents: [
-        {
-          role: "user",
-          parts: [
-            { text: "Transcribe all speech in this audio accurately word for word. If there is no clear speech, return empty string. Never invent or guess." },
-            { inlineData: { mimeType: "audio/wav", data: audio } }
-          ]
-        }
-      ],
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: { transcription: { type: Type.STRING } },
-          required: ["transcription"]
-        }
-      }
-    });
-
+    const transcriptionModels = ["gemini-3.1-flash-lite"];
     let transcribedText = "";
-    try {
-      const parsed = JSON.parse(transcriptionResponse.text || "{}");
-      transcribedText = (parsed.transcription || "").trim();
-    } catch {
-      transcribedText = (transcriptionResponse.text || "").trim();
+
+    for (const model of transcriptionModels) {
+      if (transcribedText) break;
+      try {
+        const transcriptionResponse = await safeGenerateContent({
+          preferredModel: model,
+          contents: [
+            {
+              role: "user",
+              parts: [
+                { text: "Transcribe all speech in this audio accurately word for word. If there is no clear speech or only music, return empty string. Never invent or guess." },
+                { inlineData: { mimeType: "audio/wav", data: audio } }
+              ]
+            }
+          ],
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: { transcription: { type: Type.STRING } },
+              required: ["transcription"]
+            }
+          }
+        });
+
+        const rawText = transcriptionResponse.text || "{}";
+        try {
+          const parsed = JSON.parse(rawText);
+          transcribedText = (parsed.transcription || "").trim();
+        } catch {
+          transcribedText = rawText.replace(/[{}"\[\]]/g, "").replace(/transcription:/i, "").trim();
+        }
+        console.log(`[Translate Audio] Model "${model}" result: "${transcribedText.slice(0, 80)}"`);
+      } catch (modelErr: any) {
+        console.warn(`[Translate Audio] Model "${model}" failed:`, modelErr?.message?.slice(0, 80));
+      }
     }
 
     if (!transcribedText) {
-      console.log(`[Translate Audio] No speech detected in audio chunk.`);
+      console.log(`[Translate Audio] No speech detected across all models.`);
       return res.json({ originalText: "", translatedText: "", audio: "" });
     }
-
-    console.log(`[Translate Audio] Transcribed: "${transcribedText.slice(0, 100)}..."`);
 
     // Step 2: Translate using Gemini Live API (stateless per request)
     let translatedText = transcribedText;
